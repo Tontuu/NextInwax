@@ -1,17 +1,28 @@
 let albums = [];
+let isQueueOpen: bool;
 const LOG_PREFIX = "[NIW]:"
-const STORAGE_KEY = "spicetify-queue-used-index";
+const STORAGE_KEY = "spicetify-sort-album";
 const CHECK_ICON = Spicetify.SVGIcons["check"];
 const ALBUM_ICON = Spicetify.SVGIcons["album"];
 
 async function main() {
+    console.log(LOG_PREFIX, "Last active tab: ", getData("active-tab"));
     window.clearUsedIndexes = clearUsedIndexes;
-    window.getUsedIndexes = getUsedIndexes;
+    window.getStorage = getStorage;
 
-    while (!Spicetify?.Player || !Spicetify?.CosmosAsync) {
+    if (getUsedIndexes() === null) {
+        setData("sorted_albums", []);
+        console.log(getData("sorted_albums"));
+    }
+
+    while (!Spicetify || !Spicetify.Platform || !Spicetify?.Player || !Spicetify?.CosmosAsync) {
+        console.warn(LOG_PREFIX, "Spicetify is not ready yet...!");
         await new Promise(resolve => setTimeout(resolve, 100));
     }
     console.log(LOG_PREFIX, "Spicetify is ready!");
+
+    setupObserver();
+    console.log(LOG_PREFIX, "Observer is ready!");
 
     injectStyles();
     console.log(LOG_PREFIX, "Injected styles");
@@ -20,6 +31,29 @@ async function main() {
     console.log(LOG_PREFIX, "Next in Wax running...");
 
 }
+
+
+function setupObserver() {
+    let asideQueueLastState = null;
+
+    const observer = new MutationObserver(() => {
+        isQueueOpen = !!document.querySelector('aside[aria-label="Fila"], aside[aria-label="Queue"]');
+
+        if (isQueueOpen !== asideQueueLastState) {
+            asideQueueLastState = isQueueOpen;
+            if (isQueueOpen) {
+                console.log(LOG_PREFIX, "Generating queue tab panel");
+                injectAlbumsTab();
+            }
+        }
+    })
+
+    observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+    });
+}
+
 
 function injectStyles() {
     const style = document.createElement("style");
@@ -182,16 +216,106 @@ function getRandomIndex(total) {
     return chosen;
 }
 
+function injectAlbumsTab() {
+    const tabList = document.querySelector(
+        '#Desktop_PanelContainer_Id [role="tablist"]'
+    );
+
+    if (!tabList) {
+        console.error(LOG_PREFIX, "Could not create new tab: No selector found: ", tablist);
+        return;
+    }
+
+    // Get template
+    const template = tabList.querySelector("button");
+
+    const tabButton = template.cloneNode(true);
+
+    tabButton.textContent = "Albums";
+
+    tabButton.id = "albums-tab";
+    tabButton.setAttribute("data-encore-tab-id", "albums-tab");
+
+    tabButton.setAttribute("aria-controls", "albums-panel");
+
+    tabButton.setAttribute("aria-selected", "false");
+    tabButton.setAttribute("tabIndex", "-1");
+    tabButton.dataset.tab = "albums";
+
+    tabList.appendChild(tabButton);
+    syncTabs(tabList);
+
+    tabList.addEventListener("click", (e) => {
+        const btn = e.target.closest("button");
+        if (!btn) return;
+
+        activateTab(tabList, btn);
+        const label = btn.textContent.trim().toLowerCase();
+        setData("active-tab", btn.getAttribute("id"));
+    });
+}
+
+function syncTabs(tabList) {
+    const savedTab = getData("active-tab");
+    if (!savedTab) return;
+
+    const target = tabList.querySelector(`#${savedTab}`);
+
+    if (target) {
+        activateTab(tabList, target);
+    }
+}
+
+function activateTab(tabList, targetBtn) {
+  const buttons = tabList.querySelectorAll('[role="tab"]');
+
+  buttons.forEach((btn) => {
+    btn.setAttribute('aria-selected', 'false');
+    btn.setAttribute('tabindex', '-1');
+  });
+
+  targetBtn.setAttribute('aria-selected', 'true');
+  targetBtn.setAttribute('tabindex', '0');
+}
+
+function getStorage() {
+    const data = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+    return data;
+}
+
 function getUsedIndexes() {
-    return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+    const usedIndexes = getData("sorted_albums");
+
+    if (!usedIndexes) {
+        setData("sorted_albums", []);
+    }
+    return getData("sorted_albums");
+}
+
+function getData(key) {
+    const data = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+    return data[key];
+}
+
+function setData(key, value) {
+    let data = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+        data = {};
+    }
+    data[key] = value;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    return data[key];
 }
 
 function saveUsedIndexes(usedIndexes) {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(usedIndexes));
+    setData("sorted_albums", usedIndexes);
 }
 
 function clearUsedIndexes() {
-  localStorage.removeItem(STORAGE_KEY);
+    const data = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    data["sorted_albums"] = [];
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    return data;
 }
 
 export default main;
