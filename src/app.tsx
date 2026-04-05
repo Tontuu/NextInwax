@@ -110,7 +110,6 @@ async function renderAlbumsPanel(overlay) {
         getQueueTrackUris()
     ]);
 
-    const sortedUriSet = new Set(sortedAlbums.flatMap(a => a.trackUris ?? []));
     const sortedByUri = Object.fromEntries(sortedAlbums.map(a => [a.uri, a]));
 
     const updatedSorted = sortedAlbums.map(album => {
@@ -121,7 +120,6 @@ async function renderAlbumsPanel(overlay) {
 
     setData("sorted_albums", updatedSorted);
     const queuedNIW = updatedSorted.filter(a => a.status === "queued");
-    const playedAlbums    = updatedSorted.filter(a => a.status === "played" && (a.playedTracks / a.numTracks) >= 0.5);
 
     listEl.innerHTML = "";
 
@@ -132,9 +130,7 @@ async function renderAlbumsPanel(overlay) {
     queueSectionTitle.style = sectionTitleStyle();
     queueSectionTitle.textContent = "Na Fila";
     if (queueAlbums.length === 0 ) {
-        queueSectionTitle.innerHTML = `
-        <h3 style="${emptyStyle()}">Nenhum album na fila</h3>
-        `;
+        queueSectionTitle.textContent = "Nenhum album na fila";
         queueSection.appendChild(queueSectionTitle);
     } else {
         queueSection.appendChild(queueSectionTitle);
@@ -146,21 +142,46 @@ async function renderAlbumsPanel(overlay) {
     listEl.appendChild(queueSection);
     
     // --- Section History
+    const histSectionTitleHeader = document.createElement("div");
     const histSection = document.createElement("div");
-    histSection.id = "history-section";
     const histSectionTitle = document.createElement("h3");
+    const histSectionClearButton = document.createElement("button");
+
+    histSectionTitle.textContent = "Historico de albums";
+    histSectionClearButton.textContent = "Limpar fila";
+
+    histSectionClearButton.style.cssText = sectionButtonStyle();
+    histSectionTitleHeader.style.cssText = histSectionHeaderStyle();
+    histSectionClearButton.addEventListener("mouseenter", () => {
+        histSectionClearButton.style.transform = "scale(1.04)"
+        histSectionClearButton.style.color = "var(--text-base)"
+    });
+    histSectionClearButton.addEventListener("mouseleave", () => {
+        histSectionClearButton.style.transform = "scale(1.0)"
+        histSectionClearButton.style.color = "var(--spice-subtext)"
+    });
+    histSectionClearButton.addEventListener("click", () => {
+        pruneHistory(getSortedAlbums(), true);
+        renderAlbumsPanel(albumsState.overlay)
+    });
+
+    histSectionTitleHeader.id = "history-section-header";
+    histSectionClearButton.id = "history-section-clear-button";
+    histSection.id = "history-section";
+
     histSectionTitle.style = sectionTitleStyle();
     histSection.style.marginTop = "24px";
-    histSectionTitle.textContent = "Historico de albums";
 
+    histSectionTitleHeader.appendChild(histSectionTitle);
+    histSectionTitleHeader.appendChild(histSectionClearButton);
+    histSection.appendChild(histSectionTitleHeader);
+
+    const playedAlbums = updatedSorted.filter(a => a.status === "played" && (a.playedTracks / a.numTracks) >= 0.5);
 
     if (playedAlbums.length === 0) {
-        histSectionTitle.innerHTML = `
-        <h3 style="${emptyStyle()}">Nenhum album tocado ainda</h3>
-        `;
-        histSection.appendChild(histSectionTitle);
+        histSectionTitle.textContent = "Nenhum album tocado ainda";
+        histSectionClearButton.style.display = "none";
     } else {
-        histSection.appendChild(histSectionTitle);
         // Most recent first
         [...playedAlbums].reverse().forEach(album => {
             histSection.appendChild(buildAlbumCard(album, {
@@ -369,15 +390,28 @@ function sectionTitleStyle() {
     return style;
 }
 
-function emptyStyle() {
+function histSectionHeaderStyle() {
     return `
-        color:var(--spice-subtext);
-        font-size:20px;
-        font-weight:700;
-        letter-spacing:1px;
-        padding:4px 8px;
-        text-transform:uppercase;
-        margin:0 0 80px 0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    `;
+}
+
+function sectionButtonStyle() {
+    return `
+    display: block;
+    color:var(--spice-subtext);
+    font-size:13px;
+    font-weight:700;
+    letter-spacing:1px;
+    text-transform:uppercase;
+    cursor: pointer;
+    background: none;
+    outline: none;
+    padding: 0;
+    border: none;
+    transition: transform color 0.3s ease;
     `;
 }
 
@@ -731,7 +765,7 @@ async function syncSortedAlbumsStatus() {
     });
 
     setData("sorted_albums", updatedSortedAlbums);
-    pruneHistory(updatedSortedAlbums);
+    pruneHistory(updatedSortedAlbums, false);
 
     // Refresh
     if (albumsState.overlay && albumsState.isMounted) {
@@ -739,17 +773,23 @@ async function syncSortedAlbumsStatus() {
     }
 }
 
-function pruneHistory(sortedAlbums) {
+function pruneHistory(sortedAlbums, force) {
     const played = sortedAlbums.filter(a => a.status === "played" && (a.playedTracks / a.numTracks) >= 0.5);
-    if (played.length <= MAX_HISTORY || played.length <= albums.length) return;
+    if (!force && (played.length <= MAX_HISTORY || played.length <= albums.length)) return;
 
-    const toRemove = played.length - MAX_HISTORY;
+    const toRemove = force ? sortedAlbums.length : played.length - MAX_HISTORY;
     let removed = 0;
     const pruned = sortedAlbums.filter(a => {
+        if (force) {
+            removed++;
+            return false;
+        }
+
         if (a.status === "played" && removed < toRemove) {
             removed++;
             return false;
         }
+
         return true;
     });
 
