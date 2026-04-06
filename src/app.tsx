@@ -114,7 +114,9 @@ async function renderAlbumsPanel(overlay) {
 
     const updatedSorted = sortedAlbums.map(album => {
         if (album.status === "played") return album;
+
         const stillInQueue = album.trackUris?.some(uri => queueUris.has(uri));
+        
         return { ...album, status: stillInQueue ? "queued" : "played" };
     });
 
@@ -214,6 +216,8 @@ async function getQueueAlbums() {
             const artist   = track.metadata?.artist_name ?? track.artists?.[0]?.name ?? "Unknown Artist";
             const cover    = track.metadata?.image_url ?? track.album?.images?.[0]?.url ?? "";
 
+            const isLast = index === nextTracks.length - 1;
+
             if (!albmUri || albmUri === contextUri) {
                 prevAlbumUri = null;
                 currentCount = 0;
@@ -241,16 +245,15 @@ async function getQueueAlbums() {
             prevCover = cover;
             prevAlbumUri = albmUri;
 
-            if (index === nextTracks.length - 1) {
-                if (currentCount > 1 && !albumMap.has(albmUri)) {
-                    albumMap.set(albmUri, {
-                        uri: albmUri,
-                        name: albmName,
-                        artist,
-                        coverUrl: cover,
-                        trackCount: currentCount
-                    });
-                }
+            if (isLast && currentCount > 1 && !albumMap.has(albmUri)) {
+                console.log(LOG_PREFIX, "last track count:", currentCount, "| uri:", albmUri);
+                albumMap.set(albmUri, {
+                    uri: albmUri,
+                    name: albmName,
+                    artist,
+                    coverUrl: cover,
+                    trackCount: currentCount
+                });
             }
         });
 
