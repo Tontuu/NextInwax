@@ -24,7 +24,7 @@ A [Spicetify](https://spicetify.app) extension that adds an **Albums** tab to Sp
 
 ### Manual install
 
-1. Download `nextInWax.js` and place it in your Spicetify extensions folder:
+1. Download `dist\nextinwax.js` and place it in your Spicetify extensions folder:
 
 ```
 # macOS / Linux
