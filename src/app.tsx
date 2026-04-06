@@ -118,6 +118,8 @@ async function renderAlbumsPanel(overlay) {
         return { ...album, status: stillInQueue ? "queued" : "played" };
     });
 
+    const playedAlbums = updatedSorted.filter(isAlbumPlayed);
+
     setData("sorted_albums", updatedSorted);
     const queuedNIW = updatedSorted.filter(a => a.status === "queued");
 
@@ -135,8 +137,7 @@ async function renderAlbumsPanel(overlay) {
     } else {
         queueSection.appendChild(queueSectionTitle);
         queueAlbums.forEach(album => {
-            const isNIW = !!sortedByUri[album.uri];
-            queueSection.appendChild(buildAlbumCard(album, { badge: isNIW ? "NIW" : null}));
+            queueSection.appendChild(buildAlbumCard(album, { badge: album.index !== undefined ? "NIW" : null}));
         });
     }
     listEl.appendChild(queueSection);
@@ -176,8 +177,6 @@ async function renderAlbumsPanel(overlay) {
     histSectionTitleHeader.appendChild(histSectionClearButton);
     histSection.appendChild(histSectionTitleHeader);
 
-    const playedAlbums = updatedSorted.filter(a => a.status === "played" && (a.playedTracks / a.numTracks) >= 0.5);
-
     if (playedAlbums.length === 0) {
         histSectionTitle.textContent = "Nenhum album tocado ainda";
         histSectionClearButton.style.display = "none";
@@ -198,10 +197,10 @@ async function renderAlbumsPanel(overlay) {
 async function getQueueAlbums() {
     try {
         const state = await Spicetify.Platform.PlayerAPI.getState();
-        const nextTracks = state?.nextItems ?? state?.queue?.nextItems ?? [];
+        const nextTracks = state?.nextItems ?? [];
+        const contextUri = state?.context?.uri;
 
         const albumMap = new Map();
-
         let prevAlbumUri = null;
         let prevAlbumName = null;
         let prevArtist = null;
@@ -215,7 +214,11 @@ async function getQueueAlbums() {
             const artist   = track.metadata?.artist_name ?? track.artists?.[0]?.name ?? "Unknown Artist";
             const cover    = track.metadata?.image_url ?? track.album?.images?.[0]?.url ?? "";
 
-            if (!albmUri) return;
+            if (!albmUri || albmUri === contextUri) {
+                prevAlbumUri = null;
+                currentCount = 0;
+                return;
+            }
 
             if (albmUri === prevAlbumUri) {
                 currentCount++;
@@ -394,7 +397,7 @@ function histSectionHeaderStyle() {
     return `
     display: flex;
     justify-content: space-between;
-    align-items: center;
+    align-items: end;
     `;
 }
 
@@ -466,9 +469,11 @@ async function onButtonClick(btnElement) {
     const sortedIndex = getRandomIndex(albums.length);
     const album = albums[sortedIndex];
 
-    const tracksUris = await addAlbumToQueue(album.uri);
+    const tracksUris = await fetchAlbumTracks(album.uri);
 
     if (!tracksUris) return;
+
+    await addAlbumToQueue(tracksUris);
 
     // Tiny delay before reading the state so all tracks can be added
     await new Promise(resolve => setTimeout(resolve, 300));
@@ -533,7 +538,7 @@ function revertButtonSwap(iconSVG) {
     }, { once: true });
 }
 
-async function addAlbumToQueue(URI) {
+async function fetchAlbumTracks(URI) {
     const { queryAlbumTracks } = Spicetify.GraphQL.Definitions;
     
     const { data, errors } = await Spicetify.GraphQL.Request(queryAlbumTracks, {
@@ -564,9 +569,11 @@ async function addAlbumToQueue(URI) {
         return;
     }
 
-    await Spicetify.addToQueue(tracks);
-
     return tracks;
+}
+
+async function addAlbumToQueue(tracks) {
+    await Spicetify.addToQueue(tracks);
 }
 
 async function getSavedAlbums() {
@@ -744,23 +751,43 @@ async function syncSortedAlbumsStatus() {
     }
     const currentAlbumUri = currentTrack?.album?.uri;
     const currentTrackUri = currentTrack.uri;
-
-    console.log(LOG_PREFIX, "Syncing albums...");
-    const sortedAlbums = getSortedAlbums();
-
-    if (!sortedAlbums.length) return;
-
+    let sortedAlbums = getSortedAlbums();
     const queueUris = await getQueueTrackUris();
 
+    const alreadyTracked = sortedAlbums.some(a => a.uri === currentAlbumUri);
+
+    if (!alreadyTracked && currentAlbumUri) {
+        const state = await Spicetify.Platform.PlayerAPI.getState();
+        const nextTrack = state?.nextItems?.[0];
+        const nextAlbumUri = nextTrack?.track?.metadata?.album_uri ?? nextTrack?.album?.uri
+
+
+        if (nextAlbumUri === currentAlbumUri) {
+            const tracksUris = await fetchAlbumTracks(currentAlbumUri);
+            console.log(LOG_PREFIX, "Organic album detected, saving...");
+            const newEntry = {
+                index: null,
+                uri: currentAlbumUri,
+                name: currentTrack.album?.name ?? "Unknown Album",
+                artist: currentTrack.artists[0]?.name ?? "Unknown Artist",
+                coverUrl: currentTrack.album?.images?.[1]?.url ?? "",
+                numTracks: tracksUris.length,
+                tracksUris,
+                addedAt: Date.now(),
+                status: "queued",
+                playedTracks: 1
+            }
+
+            console.log(LOG_PREFIX, "Sorted Albumns2:", sortedAlbums);
+            sortedAlbums = [...sortedAlbums, newEntry];
+            setData("sorted_albums", sortedAlbums);
+        }
+    }
+
     const updatedSortedAlbums = sortedAlbums.map(album => {
-        const isCurrentAlbum = album.uri === currentAlbumUri;
-
         const trackIndex = album.tracksUris.findIndex(track => track.uri === currentTrackUri);
-
         const playedTracks = trackIndex >= 0 ? trackIndex + 1 : album.playedTracks;
-
-        const stillInQueue = album.trackUris?.some(uri => queueUris.has(uri));
-
+        const stillInQueue = album.tracksUris?.some(uri => queueUris.has(uri));
         return { ...album, playedTracks, status: stillInQueue ? "queued" : "played"};
     });
 
@@ -774,10 +801,11 @@ async function syncSortedAlbumsStatus() {
 }
 
 function pruneHistory(sortedAlbums, force) {
-    const played = sortedAlbums.filter(a => a.status === "played" && (a.playedTracks / a.numTracks) >= 0.5);
-    if (!force && (played.length <= MAX_HISTORY || played.length <= albums.length)) return;
+    const playedAlbums = sortedAlbums.filter(isAlbumPlayed);
 
-    const toRemove = force ? sortedAlbums.length : played.length - MAX_HISTORY;
+    if (!force && (playedAlbums.length <= MAX_HISTORY || playedAlbums.length <= albums.length)) return;
+
+    const toRemove = force ? sortedAlbums.length : playedAlbums.length - MAX_HISTORY;
     let removed = 0;
     const pruned = sortedAlbums.filter(a => {
         if (force) {
@@ -795,6 +823,12 @@ function pruneHistory(sortedAlbums, force) {
 
     console.warn(LOG_PREFIX, `Pruned ${toRemove} old history entries.`);
     setData("sorted_albums", pruned);
+}
+
+function isAlbumPlayed(album) {
+    if (album.status !== "played") return false;
+    if (album.numTracks === null) return album.playedTracks >= 2;
+    return (album.playedTracks / album.numTracks) >= 0.5;
 }
 
 // ------- Storage Helpers
