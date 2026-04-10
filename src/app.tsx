@@ -1,23 +1,24 @@
-let albums = [];
-const albumsState = {
-    overlay: null,
-    isMounted: false
-}
-const MAX_HISTORY = 100;
-const LOG_PREFIX = "[NIW]:"
-const STORAGE_KEY = "spicetify-sort-album";
-const CHECK_ICON = Spicetify.SVGIcons["check"];
-const ALBUM_ICON = Spicetify.SVGIcons["album"];
+// ------- CONSTANTS
+const LOG_PREFIX         = "[NIW]:"
+const STORAGE_KEY        = "spicetify-sort-album";
+const QUEUED_ALBUMS_KEY  = "queued_albums";
+const SORTED_ALBUMS_KEY  = "sorted_albums";
+const HISTORY_ALBUMS_KEY = "history_albums";
+const SAVED_ALBUMS_KEY   = "saved_albums";
+const TAB_KEY            = "active-tab";
+const MAX_HISTORY        = 100;
+
+// ------- IMPORTANT VARIABLES
+let isAlbumTabLoaded = false;
+let isAlbumsTabOpen  = false;
+let albumState = {};
 
 async function main() {
-    console.log(LOG_PREFIX, "Last active tab: ", getData("active-tab"));
-    window.clearUsedIndexes = clearUsedIndexes;
+    injectStyle();
     window.getStorage = getStorage;
-
-    if (getUsedIndexes() === null) {
-        setData("sorted_albums", []);
-        console.log(getData("sorted_albums"));
-    }
+    window.setData = setData;
+    window.sortSavedAlbum = sortSavedAlbum;
+    window.clearStorage = clearStorage;
 
     while (!Spicetify || !Spicetify.Platform || !Spicetify?.Player || !Spicetify?.CosmosAsync) {
         console.warn(LOG_PREFIX, "Spicetify is not ready yet...!");
@@ -25,561 +26,115 @@ async function main() {
     }
     console.log(LOG_PREFIX, "Spicetify is ready!");
 
-    setupObserver();
-    console.log(LOG_PREFIX, "Observer is ready!");
+    handleObserver();
+    await handleQueueUpdateEvent();
 
-    injectStyles();
-    console.log(LOG_PREFIX, "Injected styles");
-
-    setupSongChangeListener();
-    console.log(LOG_PREFIX, "Song change listener ready!");
-
-    setupQueueUpdateListener();
-    console.log(LOG_PREFIX, "Queue update listener ready!");
-
-    await new Promise(resolve => setTimeout(resolve, 300));
-    syncSortedAlbumsStatus();
-    console.log(LOG_PREFIX, "Initialization sync started!");
-
-    initExtension();
-    console.log(LOG_PREFIX, "Next in Wax running...");
+    // SYNC ON INTIALIZATION
+    await syncAlbumsQueue(); 
+    syncAlbumsHistory();
 }
 
-function setupObserver() {
-    let asideQueueLastState = null;
+// ------- HANDLERS
+let isQueueOpen = false;
+function handleObserver() {
+    const handleMutation = debounce(() => {
+        const panelOpenNow = !!document.querySelector(
+            'aside[aria-label="Fila"], aside[aria-label="Queue"]');
 
-    const observer = new MutationObserver(() => {
-        const isQueueOpen = !!document.querySelector(
-            'aside[aria-label="Fila"], aside[aria-label="Queue"]'
-        );
+        handleTabClickEvents();
 
-        if (isQueueOpen !== asideQueueLastState) {
-            asideQueueLastState = isQueueOpen;
-            updateAlbumsUI(isQueueOpen);
+        if (isQueueOpen === panelOpenNow) return;
+        isQueueOpen = panelOpenNow;
+
+        if (isQueueOpen) {
+            injectTab();
+            syncTabs();
+        } else {
+            isAlbumTabLoaded = false;
+            isAlbumsTabOpen  = false;
+            destroyAlbumsView();
         }
-    });
+    }, 100);
 
-    observer.observe(document.body, {
-        childList: true,
-        subtree: true,
-    });
+    const observer = new MutationObserver(handleMutation);
+    observer.observe(document.body, { childList: true, subtree: true });
 }
 
-function updateAlbumsUI(isQueueOpen) {
-    const isAlbumsTab = getData("active-tab") === "albums-tab";
+async function handleQueueUpdateEvent() {
+    Spicetify.Platform.PlayerAPI._queue._events._emitter.on("queue_update", async () => {
+        await syncAlbumsQueue(); 
+        syncAlbumsHistory();
+        updateAlbumsView();
+    });
+    Spicetify.Player.addEventListener("songchange", async (event) => {
+        const track    = event.data.item;
+        const trackUri = track.uri;
+        const albumUri = track.album.uri;
 
-    if (isQueueOpen) {
-        const tabList = injectAlbumsTab();
+        if (!albumState[albumUri]) albumState[albumUri] = {playedTracks: new Set(), addedAt: Date.now()};
 
+        albumState[albumUri].playedTracks.add(trackUri);
+    })
+}
+
+async function handleTabClickEvents() {
+    const tabList = getTabList();
+
+    if (tabList) {
         tabList.addEventListener("click", (e) => {
+            injectTab();
             const btn = e.target.closest("button");
             if (!btn) return;
 
-            activateTab(tabList, btn);
-            setData("active-tab", btn.getAttribute("id"));
-            updateAlbumsUI(true);
+            const currentTab = activateTab(tabList, btn);
+            setData(TAB_KEY, currentTab.id);
+            syncTabs();
         });
     }
-
-    if (!isQueueOpen || !isAlbumsTab) {
-        destroyAlbumsView();
-        return;
-    }
-
-    if (!albumsState.overlay) {
-        albumsState.overlay = injectAlbumsView();
-    }
-
-    if (albumsState.overlay) {
-        toggleAlbumsView(albumsState.overlay, true);
-        renderAlbumsPanel(albumsState.overlay);
-    }
 }
 
-// ---- Panel Rendering
+// ------- STORAGE HELPERS
 
-async function renderAlbumsPanel(overlay) {
-    const listEl = overlay.querySelector("#album-queue-list");
-    if (!listEl) return;
-
-    listEl.innerHTML = `<p style="color:var(--spice-subtext);font-size:13px;padding:8px 0;">Carregando...</p>`;
-    
-    const [queueAlbums, sortedAlbums, queueUris] = await Promise.all([
-        getQueueAlbums(),
-        Promise.resolve(getSortedAlbums()),
-        getQueueTrackUris()
-    ]);
-
-    const sortedByUri = Object.fromEntries(sortedAlbums.map(a => [a.uri, a]));
-
-    const updatedSorted = sortedAlbums.map(album => {
-        if (album.status === "played") return album;
-
-        const stillInQueue = album.trackUris?.some(uri => queueUris.has(uri));
-        
-        return { ...album, status: stillInQueue ? "queued" : "played" };
-    });
-
-    const playedAlbums = updatedSorted.filter(isAlbumPlayed);
-
-    setData("sorted_albums", updatedSorted);
-    const queuedNIW = updatedSorted.filter(a => a.status === "queued");
-
-    listEl.innerHTML = "";
-
-    // --- Section: Queue
-    const queueSection = document.createElement("div");
-    queueSection.id = "queue-section";
-    const queueSectionTitle = document.createElement("h3");
-    queueSectionTitle.style = sectionTitleStyle();
-    queueSectionTitle.textContent = "Na Fila";
-    if (queueAlbums.length === 0 ) {
-        queueSectionTitle.textContent = "Nenhum album na fila";
-        queueSection.appendChild(queueSectionTitle);
-    } else {
-        queueSection.appendChild(queueSectionTitle);
-        queueAlbums.forEach(album => {
-            queueSection.appendChild(buildAlbumCard(album, { badge: album.index !== undefined ? "NIW" : null}));
-        });
-    }
-    listEl.appendChild(queueSection);
-    
-    // --- Section History
-    const histSectionTitleHeader = document.createElement("div");
-    const histSection = document.createElement("div");
-    const histSectionTitle = document.createElement("h3");
-    const histSectionClearButton = document.createElement("button");
-
-    histSectionTitle.textContent = "Historico de albums";
-    histSectionClearButton.textContent = "Limpar fila";
-
-    histSectionClearButton.style.cssText = sectionButtonStyle();
-    histSectionTitleHeader.style.cssText = histSectionHeaderStyle();
-    histSectionClearButton.addEventListener("mouseenter", () => {
-        histSectionClearButton.style.transform = "scale(1.04)"
-        histSectionClearButton.style.color = "var(--text-base)"
-    });
-    histSectionClearButton.addEventListener("mouseleave", () => {
-        histSectionClearButton.style.transform = "scale(1.0)"
-        histSectionClearButton.style.color = "var(--spice-subtext)"
-    });
-    histSectionClearButton.addEventListener("click", () => {
-        pruneHistory(getSortedAlbums(), true);
-        renderAlbumsPanel(albumsState.overlay)
-    });
-
-    histSectionTitleHeader.id = "history-section-header";
-    histSectionClearButton.id = "history-section-clear-button";
-    histSection.id = "history-section";
-
-    histSectionTitle.style = sectionTitleStyle();
-    histSection.style.marginTop = "24px";
-
-    histSectionTitleHeader.appendChild(histSectionTitle);
-    histSectionTitleHeader.appendChild(histSectionClearButton);
-    histSection.appendChild(histSectionTitleHeader);
-
-    if (playedAlbums.length === 0) {
-        histSectionTitle.textContent = "Nenhum album tocado ainda";
-        histSectionClearButton.style.display = "none";
-    } else {
-        // Most recent first
-        [...playedAlbums].reverse().forEach(album => {
-            histSection.appendChild(buildAlbumCard(album, {
-                badge: "NIW",
-                progress: album.playedTracks ?? 0,
-                total: album.numTracks,
-            }));
-        });
-    }
-    listEl.appendChild(histSection);
+function getStorage() {
+    return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
 }
 
-// Reads the current Spotify queue and group consecutive tracks that share the same album URI, it only returns albums that has more than 1 track in Queue CONSECUTIVELy
-async function getQueueAlbums() {
-    try {
-        const state = await Spicetify.Platform.PlayerAPI.getState();
-        const nextTracks = state?.nextItems ?? [];
-        const contextUri = state?.context?.uri;
-
-        const albumMap = new Map();
-        let prevAlbumUri = null;
-        let prevAlbumName = null;
-        let prevArtist = null;
-        let prevCover = null;
-        let currentCount = 0;
-
-        nextTracks.forEach((t, index) => {
-            const track    = t.track ?? t;
-            const albmUri  = track.metadata?.album_uri ?? track.album?.uri;
-            const albmName = track.metadata?.album_title ?? track.album?.name ?? "Unknown Album";
-            const artist   = track.metadata?.artist_name ?? track.artists?.[0]?.name ?? "Unknown Artist";
-            const cover    = track.metadata?.image_url ?? track.album?.images?.[0]?.url ?? "";
-
-            const isLast = index === nextTracks.length - 1;
-
-            if (!albmUri || albmUri === contextUri) {
-                prevAlbumUri = null;
-                currentCount = 0;
-                return;
-            }
-
-            if (albmUri === prevAlbumUri) {
-                currentCount++;
-            } else {
-                if (prevAlbumUri && currentCount > 1 && !albumMap.has(prevAlbumUri)) {
-                    albumMap.set(prevAlbumUri, {
-                        uri: prevAlbumUri,
-                        name: prevAlbumName,
-                        artist: prevArtist,
-                        coverUrl: prevCover,
-                        trackCount: currentCount
-                    });
-                }
-
-                currentCount = 1;
-            }
-
-            prevAlbumName = albmName;
-            prevArtist = artist;
-            prevCover = cover;
-            prevAlbumUri = albmUri;
-
-            if (isLast && currentCount > 1 && !albumMap.has(albmUri)) {
-                console.log(LOG_PREFIX, "last track count:", currentCount, "| uri:", albmUri);
-                albumMap.set(albmUri, {
-                    uri: albmUri,
-                    name: albmName,
-                    artist,
-                    coverUrl: cover,
-                    trackCount: currentCount
-                });
-            }
-        });
-
-        return [...albumMap.values()];
-    } catch (e) {
-        console.error(LOG_PREFIX, "Failed to get queue albums:", e);
-        return [];
-    }
+function setData(key, value) {
+    let data = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+    if (!data || typeof data !== "object" || Array.isArray(data))  data = {};
+    data[key] = value;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    return data[key];
 }
 
-function buildAlbumCard(album, { badge = null, progress = null, total = null} = {}) {
-    const card = document.createElement("div");
-    card.id = "album-card";
-    card.style.cssText = `
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        padding: 8px;
-        border-radius: 6px;
-        margin-bottom: 4px;
-        transition: background 0.15s;
-    `;
-    card.addEventListener("mouseenter", () => card.style.background = "var(--spice-highlight)");
-    card.addEventListener("mouseleave", () => card.style.background = "transparent");
-    
-    const img = document.createElement("img");
-    img.src = album.coverUrl ?? "";
-    img.alt = album.name;
-    img.style.cssText = `
-        width:48px;
-        height:48px;
-        border-radius:4px;
-        object-fit:cover;
-        flex-shrink:0;
-        background:var(--spice-card);
-    `;
+function getData(key) {
+    const data = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
 
-    const info = document.createElement("div");
-    info.style.cssText = "flex:1; min-width:0; max-width: 60%;"
+    let storageData = data[key];
 
-    const nameEl = document.createElement("div");
-    nameEl.textContent = album.name ?? "Unknown Album";
-    nameEl.style.cssText = `
-        color:var(--spice-text);
-        text-decoration: none;
-        font-size:14px;
-        font-weight:600;
-        white-space:nowrap;
-        overflow:hidden;
-        text-overflow:ellipsis;
-        cursor: pointer;
-    `
-    nameEl.addEventListener("click", () => {
-        Spicetify.Platform.History.push(`/album/${album.uri.split(":")[2]}`);
-    })
-    nameEl.addEventListener("mouseenter", () => nameEl.style.textDecoration = "underline");
-    nameEl.addEventListener("mouseleave", () => nameEl.style.textDecoration = "none");
-
-    const artistEl = document.createElement("div");
-    artistEl.textContent = album.artist ?? "Unknown Artist";
-    artistEl.style.cssText = `
-        color:var(--spice-subtext);
-        font-size:13px;
-        white-space:nowrap;
-        overflow:hidden;
-        text-overflow:ellipsis;
-        margin-top:2px;
-    `;
-
-    const wrapper = document.createElement("div");
-    wrapper.id = "album-info-wrapper";
-    wrapper.appendChild(nameEl);
-    wrapper.appendChild(artistEl);
-
-    if (progress !== null && total) {
-        const pct = Math.min(100, Math.round((progress / total) * 100));
-        const barWrap = document.createElement("div");
-        barWrap.style.cssText = "margin-top:5px;height:3px;background:var(--spice-card);border-radius:2px;overflow:hidden;";
-        const barFill = document.createElement("div");
-        barFill.style.cssText = `width:${pct}%;height:100%;background:var(--spice-text);border-radius:2px;transition:width 0.3s;`;
-        barWrap.appendChild(barFill);
-
-        const trackLabel = document.createElement("div");
-        trackLabel.textContent = `${progress} / ${total} faixas`;
-        trackLabel.style.cssText = "color:var(--spice-subtext);font-size:11px;margin-top:3px;";
-
-        wrapper.appendChild(barWrap);
-        wrapper.appendChild(trackLabel);
-    }
-
-    info.appendChild(wrapper);
-
-    card.appendChild(img);
-    card.appendChild(info);
-
-    if (badge) {
-        const badgeEl = document.createElement("span");
-        badgeEl.textContent = badge;
-        badgeEl.style.cssText = `
-            margin-left: 40px;
-            font-size:10px;
-            font-weight:700;
-            padding:2px 6px;
-            border-radius:99px;
-            background:var(--spice-button);
-            color:var(--spice-text);
-            flex-shrink:0;
-            letter-spacing:0.5px;
-        `;
-        card.appendChild(badgeEl);
-    }
-
-    return card;
-}
-
-async function getQueueTrackUris() {
-    try {
-        const state = await Spicetify.Platform.PlayerAPI.getState();
-        const nextTracks = state?.nextItems ?? state?.queue?.nextItems ?? [];
-
-        return new Set(nextTracks.map(t => t.uri ?? t.track?.uri).filter(Boolean));
-    } catch (e) {
-        console.error(LOG_PREFIX, "Failed to read queue state: ", e);
-        return new Set();
-    }
-}
-
-// --- Style section
-
-function sectionTitleStyle() {
-    const style = document.createElement("style");
-    style.innerHTML = `
-    color:var(--spice-subtext);
-    font-size:11px;
-    font-weight:700;
-    letter-spacing:1px;
-    text-transform:uppercase;
-    margin:0 0 8px 0;
-    `
-    return style;
-}
-
-function histSectionHeaderStyle() {
-    return `
-    display: flex;
-    justify-content: space-between;
-    align-items: end;
-    `;
-}
-
-function sectionButtonStyle() {
-    return `
-    display: block;
-    color:var(--spice-subtext);
-    font-size:13px;
-    font-weight:700;
-    letter-spacing:1px;
-    text-transform:uppercase;
-    cursor: pointer;
-    background: none;
-    outline: none;
-    padding: 0;
-    border: none;
-    transition: transform color 0.3s ease;
-    `;
-}
-
-function injectStyles() {
-    const style = document.createElement("style");
-    style.textContent = `
-        @keyframes flipOut {
-            from { transform: rotateY(0deg); }
-            to   { transform: rotateY(90deg); }
+    if (!storageData) {
+        if (key === TAB_KEY) storageData = "queue-tab";
+        if (key === SORTED_ALBUMS_KEY  ||
+            key === HISTORY_ALBUMS_KEY ||
+            key === QUEUED_ALBUMS_KEY ||
+            key === SAVED_ALBUMS_KEY)
+        {
+            storageData = [];
         }
-        @keyframes flipIn {
-            from { transform: rotateY(90deg); }
-            to   { transform: rotateY(0deg); }
-        }
-    `;
-
-    document.head.appendChild(style);
-}
-
-async function initExtension() {
-    albums = await getSavedAlbums();
-    window.albums = albums;
-
-    const button = createButton();
-    button.element.addEventListener("click", async () => onButtonClick(button));
-}
-
-function createButton() {
-    const button = new Spicetify.Topbar.Button;
-
-    button.label = "Add random album to queue";
-    button.icon = "album";
-
-    const btnElement = button.element.querySelector("button");
-    btnElement.classList.add("main-globalNav-link-icon");
-    btnElement.style.padding = "12px";
-    btnElement.style.backgroundColor = "var(--spice-card)";
-    btnElement.style.perspective = "200px";
-    
-    const iconSVG = button.element.querySelector("svg");
-    iconSVG.classList.add("Svg-sc-ytk21e-0", "Svg-img-icon-medium")
-    iconSVG.style.color = "var(--spice-text)";
-
-    return button;
-}
-
-// Searches for saved albums, sort one of them and add them to queue.
-async function onButtonClick(btnElement) {
-    const iconSVG = btnElement.element.querySelector("svg");
-    animateButtonSwap(btnElement, iconSVG);
-
-    const sortedIndex = getRandomIndex(albums.length);
-    const album = albums[sortedIndex];
-
-    const tracksUris = await fetchAlbumTracks(album.uri);
-
-    if (!tracksUris) return;
-
-    await addAlbumToQueue(tracksUris);
-
-    // Tiny delay before reading the state so all tracks can be added
-    await new Promise(resolve => setTimeout(resolve, 300));
-
-    const state = Spicetify.Platform.PlayerAPI.getState();
-    const match = state.nextItems.find(item => item.album.uri === album.uri)
-
-    // Save enriched album entry
-    const coverUrl = match?.album.images[1]?.url ?? "Not Found";
-
-    const newEntry = {
-        index: album.index,
-        uri: album.uri,
-        name: album.name,
-        artist: album.artist.name,
-        numTracks: album.numTracks,
-        coverUrl,
-        tracksUris, // Needed for queue cross reference
-        addedAt: Date.now(),
-        status: "queued",
-        playedTracks: 0,
-    };
-
-    const current = getSortedAlbums();
-    setData("sorted_albums", [...current, newEntry]);
-
-    if (albumsState.overlay && albumsState.isMounted) {
-        renderAlbumsPanel(albumsState.overlay);
     }
 
-    console.log(LOG_PREFIX, 
-        `${albums[sortedIndex].numTracks} songs from ${albums[sortedIndex].name} made by ${albums[sortedIndex].artist.name} were added to queue.`
-);
-
-    Spicetify.showNotification(
-        `${albums[sortedIndex].numTracks} songs from ${albums[sortedIndex].name} made by ${albums[sortedIndex].artist.name} were added to queue!!! 😄`
-    );
+    setData(key, storageData);
+    return storageData;
 }
 
-function animateButtonSwap(btnElement, iconSVG) {
-    // First it rotates
-    iconSVG.style.animation = "flipOut 0.2s ease-in forwards";
-
-    iconSVG.addEventListener("animationend", () => {
-        iconSVG.innerHTML = CHECK_ICON;
-        iconSVG.style.animation = "flipIn 0.2s ease-out forwards";
-    }, { once: true });
-
-    setTimeout(() => revertButtonSwap(iconSVG), 1500);
+function getSortedAlbums() {
+    return new Set(getData(SORTED_ALBUMS_KEY) ?? []);
+}
+function clearStorage() {
+    Spicetify.LocalStorage.clear();
 }
 
-function revertButtonSwap(iconSVG) {
-    iconSVG.style.animation = "flipOut 0.2s ease-in forwards";
-
-    iconSVG.addEventListener("animationend", () => {
-        iconSVG.innerHTML = ALBUM_ICON;
-        iconSVG.style.animation = "flipIn 0.2s ease-out backwards";
-
-        iconSVG.addEventListener("animationend", () => {
-            iconSVG.style.animation = "";
-        }, { once: true });
-    }, { once: true });
-}
-
-async function fetchAlbumTracks(URI) {
-    const { queryAlbumTracks } = Spicetify.GraphQL.Definitions;
-    
-    const { data, errors } = await Spicetify.GraphQL.Request(queryAlbumTracks, {
-        uri: URI,
-        offset: 0,
-        limit: 100,
-    });
-
-    if (errors) {
-        console.error(LOG_PREFIX, "Error trying to search for album:", errors);
-        return;
-    }
-
-    if (data.albumUnion.playability.playable === false) {
-        console.error(LOG_PREFIX, "Album not available");
-        return;
-    }
-
-    const trackItems = (data.albumUnion?.tracksV2 ?? data.albumUnion?.tracks ?? { items: []}).items;
-
-
-    const tracks = trackItems
-        .filter(({ track }) => track.playability.playable)
-        .map(({ track }) => ({uri: track.uri}));
-
-    if (!tracks.length) {
-        console.error(LOG_PREFIX, "No track available");
-        return;
-    }
-
-    return tracks;
-}
-
-async function addAlbumToQueue(tracks) {
-    await Spicetify.addToQueue(tracks);
-}
-
-async function getSavedAlbums() {
+async function getSavedAlbumsUris() {
     const res = await Spicetify.CosmosAsync.get(
         "sp://core-collection/unstable/@/list/albums/all?responseFormat=protobufJson"
     );
@@ -589,79 +144,412 @@ async function getSavedAlbums() {
         return [];
     }
 
-    const albums = res.item.map((item, index) => ({
-        index: item.index,
+    const uris = res.item.map((item, index) => ({
         uri: item.albumMetadata.link,
-        name: item.albumMetadata.name,
-        artist: item.albumMetadata.artists[0],
-        coverUrl: item.albumMetadata.cover,
-        numTracks: item.albumMetadata.numTracks
     }));
 
-    console.log(LOG_PREFIX, `${albums.length} albums found!`);
+    console.log(LOG_PREFIX, `${uris.length} albums found!`);
 
-    return albums;
+    return new Set(uris);
 }
 
-function getRandomIndex(total) {
-    const usedIndexes = getUsedIndexes();
+// ------- ALBUM MANAGEMENT
 
-    // If all indexes were used we reset them.
-    if (usedIndexes.length >= total) {
+async function sortSavedAlbum() {
+    // First update saved albums
+    const savedAlbumsUris = await getSavedAlbumsUris();
+    setData(SAVED_ALBUMS_KEY, Array.from(savedAlbumsUris));
+
+    const sortedAlbums = getSortedAlbums();  
+
+    if (sortedAlbums.size >= savedAlbumsUris.size) {
         console.warn(LOG_PREFIX, "All indexes were used, emptying the stack...");
+        setData(SORTED_ALBUMS_KEY, []);
+        return sortSavedAlbum();
+    }  else {
+        let availableAlbums = [];
 
-        // Only clear the "played" ones, keep "queued"
-        const queued = getSortedAlbums().filter(a => a.status === "queued");
-        setData("sorted_albums", queued);
+        for (const album of savedAlbumsUris) {
+            if (!sortedAlbums.has(album.uri)) {
+                availableAlbums.push(album.uri);
+            }
+        }
+
+        const chosenIndex = Math.floor(Math.random() * availableAlbums.length);
+        const chosenAlbum = availableAlbums[chosenIndex];
+        sortedAlbums.add(chosenAlbum);
+        setData(SORTED_ALBUMS_KEY, Array.from(sortedAlbums))
+        
+        const albumtracks = await fetchAlbumTracks(chosenAlbum);
+        await addAlbumToQueue(albumTracks);
+    }
+}
+
+
+async function syncAlbumsQueue() {
+    try {
+        let queuedAlbums   = [];
+        let albumCount     = new Map();
+        const playerState  = await Spicetify.Platform.PlayerAPI.getState();
+        const nextTracks   = playerState?.nextItems;
+        const currentTrack = playerState?.item;
+
+        if (!currentTrack || !nextTracks) return;
+        nextTracks.unshift(currentTrack);
+        
+        for (const track of nextTracks) {
+            const albumUri = track.album?.uri;
+            albumCount.set(albumUri, (albumCount.get(albumUri) ?? 0) + 1);
+        }
+
+        const sortedAlbums = getSortedAlbums();
+
+        await Promise.all(
+            [...albumCount.entries()]
+            .filter(([uri, count]) => count >= 2 && uri !== "")
+            .map(async ([uri, count]) => {
+                const albumInfo = await getAlbumInfo(uri);
+                if (!albumInfo) return;
+
+                const playedTracks = albumState[uri]?.playedTracks.size ?? 0;
+                const addedAt = albumState[uri]?.addedAt ?? Date.now();
+                albumInfo.playedTracks = playedTracks;
+                albumInfo.addedAt = addedAt;
+                albumInfo.isNIW = sortedAlbums.has(uri);
+
+                queuedAlbums.push(albumInfo)
+            })
+        )
+        setData(QUEUED_ALBUMS_KEY, queuedAlbums);
+    } catch (error) {
+        console.error(LOG_PREFIX, "Failed to sync queue albums:", error);
+    }
+}
+
+function syncAlbumsHistory() {
+    const queuedAlbums   = getData(QUEUED_ALBUMS_KEY);
+    const historyAlbums  = getData(HISTORY_ALBUMS_KEY);
+    const addedToHistory = new Set(historyAlbums.map(a => a.uri));
+
+    if (!queuedAlbums) return;
+
+    for (album of queuedAlbums) {
+        if (!addedToHistory.has(album.uri) && album.playedTracks >= (album.totalTracks / 2)) {
+            historyAlbums.push(album);
+            addedToHistory.add(album.uri);
+        }
     }
 
-    const currentIndexes = getUsedIndexes();
-
-    const available = Array.from({ length: total}, (_, i) => i).filter(i => !currentIndexes.includes(i));
-
-
-    return available[Math.floor(Math.random() * available.length)];
+    setData(HISTORY_ALBUMS_KEY, historyAlbums);
 }
 
-function injectAlbumsTab() {
-    const tabList = document.querySelector(
-        '#Desktop_PanelContainer_Id [role="tablist"]'
+const pendingRequests = new Map();
+async function getAlbumInfo(albumUri) {
+    if (pendingRequests.has(albumUri)) {
+        return pendingRequests.get(albumUri);
+    }
+
+    const query = Spicetify.GraphQL.Definitions.getAlbum;
+
+    const promise = Spicetify.GraphQL.Request(query, {
+        uri: albumUri,
+        offset: 0,
+        limit: 50,
+    }).then(({ data, errors }) => {
+        if (errors) {
+            console.error(LOG_PREFIX, "Error trying to search for album:", errors);
+            console.error(albumUri);
+            return null;
+        }
+        return {
+            uri: data.albumUnion?.uri,
+            name: data.albumUnion?.name,
+            artist: data.albumUnion?.artists,
+            coverUrl: data.albumUnion?.coverArt?.sources?.[1]?.url,
+            totalTracks: data.albumUnion?.tracksV2?.totalCount,
+            tracksUris: data.albumUnion?.tracksV2?.items,
+            userSaved: data.albumUnion?.saved
+        };
+    }).finally(() => {
+        pendingRequests.delete(albumUri);
+    });
+
+    pendingRequests.set(albumUri, promise);
+
+    return promise;
+}
+
+async function fetchAlbumTracks(uri) {
+    const query = Spicetify.GraphQL.Definitions.queryAlbumTracks
+    const { data, errors } = await Spicetify.GraphQL.Request(query, {
+        uri: uri, offset: 0, limit: 100,
+    });
+
+    if (errors) {
+        console.error(LOG_PREFIX, "Error trying to search for album:", errors);
+        return [];
+    }
+
+    if (data.albumUnion.playability.playable === false) {
+        console.error(LOG_PREFIX, "Album not available:", uri);
+        return [];
+    }
+
+    const trackItems = data.albumUnion?.tracksV2.items;
+
+    if (!tracksItems.length) {
+        console.error(LOG_PREFIX, "No track available");
+        return [];
+    }
+
+    const tracks = trackItems
+        .filter(({ track }) => track.playability.playable)
+        .map(({ track }) => ({uri: track.uri}));
+
+    return tracks;
+}
+
+async function addAlbumToQueue(tracks) {
+    await Spicetify.addToQueue(tracks);
+}
+
+// ------ UI
+function injectTab() {
+    const tabList = getTabList();
+
+    if (!tabList) {
+        console.error(LOG_PREFIX, "Could not find TabList");
+        return;
+    }
+
+    if (tabList.querySelector("#albums-tab")) { return; }
+
+    // Get template
+    const template = tabList.querySelector("button");
+    const tabButton = template.cloneNode(true);
+
+    tabButton.textContent = "Albums";
+
+    tabButton.id = "albums-tab";
+    tabButton.setAttribute("data-encore-tab-id", "albums-tab");
+
+    tabButton.setAttribute("aria-controls", "albums-panel");
+
+    tabButton.setAttribute("aria-selected", "false");
+    tabButton.setAttribute("tabIndex", "-1");
+    tabButton.dataset.tab = "albums";
+
+    tabList.appendChild(tabButton);
+
+    // Sync on initialization
+    syncTabs(tabList);
+}
+
+function getTabList() {
+    const queuePanel = document.querySelector(
+        'aside[aria-label="Fila"], [aria-label="Queue"]'
     );
 
-    if (!tabList.querySelector("#albums-tab")) {
-        console.log(LOG_PREFIX, "Generating albums tab");
-        // Get template
-        const template = tabList.querySelector("button");
-        const tabButton = template.cloneNode(true);
+    const tabList = queuePanel?.querySelector(
+        '[role="tablist"]'
+    );
 
-        tabButton.textContent = "Albums";
-
-        tabButton.id = "albums-tab";
-        tabButton.setAttribute("data-encore-tab-id", "albums-tab");
-
-        tabButton.setAttribute("aria-controls", "albums-panel");
-
-        tabButton.setAttribute("aria-selected", "false");
-        tabButton.setAttribute("tabIndex", "-1");
-        tabButton.dataset.tab = "albums";
-
-        tabList.appendChild(tabButton);
-    }
-
-    syncTabs(tabList);
     return tabList;
 }
 
+function syncTabs() {
+    const tabList = getTabList();
+    const savedTab = getData(TAB_KEY);
 
-function syncTabs(tabList) {
-    const savedTab = getData("active-tab");
-    if (!savedTab) return;
+    if (!savedTab || !tabList) return;
 
     const target = tabList.querySelector(`#${savedTab}`);
 
     if (target) {
         activateTab(tabList, target);
     }
+
+    if (savedTab === "albums-tab") {
+        if (!isAlbumTabLoaded && !isAlbumsTabOpen) {
+            injectAlbumsView();
+            isAlbumTabLoaded = true;
+            isAlbumsTapOpen  = true;
+        } 
+    } 
+
+    if (savedTab === "albums-tab" && isAlbumTabLoaded) {
+        isAlbumsTabOpen = true;
+        unhideAlbumsView();
+        return;
+    }
+
+    if (isAlbumTabLoaded && savedTab !== "albums-tab" && isAlbumsTabOpen) {
+        hideAlbumsView();
+        isAlbumsTabOpen = false;
+        return;
+    }
+}
+
+function injectAlbumsView() {
+    const queuedAlbums = getData(QUEUED_ALBUMS_KEY);
+    queuedAlbums.sort((a, b) => b.addedAt - a.addedAt);
+    const historyAlbums = getData(HISTORY_ALBUMS_KEY);
+
+    const overlay = document.createElement("div");
+    if (!isAlbumsTabOpen) overlay.style.display = "none";
+    overlay.id = "album-queue-list";
+
+    const queueSection = makeQueueSection(queuedAlbums);
+    const historySection = makeHistorySection(historyAlbums);
+
+    const wrapper = document.createElement("div");
+    wrapper.id = "sections-wrapper";
+
+    wrapper.appendChild(queueSection);
+    wrapper.appendChild(historySection);
+    overlay.appendChild(wrapper);
+
+    const hostElement = getHostElement();
+    if (!hostElement) {
+        console.error(LOG_PREFIX, "Could not find host element");
+        return;
+    };
+
+    hostElement.appendChild(overlay);
+}
+
+function updateAlbumsView() {
+    destroyAlbumsView();
+    injectAlbumsView();
+}
+
+function makeQueueSection(albums) {
+    const element = document.createElement("div");
+    element.id = "queue-section";
+    const elementHeader = document.createElement("h3");
+    element.appendChild(elementHeader);
+
+    if (albums.length === 0) {
+        elementHeader.textContent = "Nenhum album na fila";
+        return element;
+    }
+
+    elementHeader.textContent = "Na fila";
+    [...albums].reverse().forEach(album => {
+        const card = buildAlbumCard(album);
+        element.appendChild(card)
+    }) 
+
+    return element;
+}
+
+function makeHistorySection(albums) {
+    const element = document.createElement("div");
+    element.id = "history-section";
+    const elementHeader = document.createElement("h3");
+    element.appendChild(elementHeader);
+
+    if (albums.length === 0) {
+        elementHeader.textContent = "Nenhum album no histórico";
+        return element;
+    }
+
+    elementHeader.textContent = "Histórico de Albums";
+    [...albums].reverse().forEach(album => {
+        const card = buildAlbumCard(album);
+        element.appendChild(card)
+    }) 
+
+    return element;
+}
+
+function buildAlbumCard(album) {
+    const card = document.createElement("div");
+    card.id = "album-card";
+
+    const wrapper = document.createElement("div");
+    wrapper.id = "card-info-wrapper";
+
+    const nameEl = document.createElement("a");
+    nameEl.textContent = album.name;
+    nameEl.id = "album-name";
+    nameEl.href = album.uri;
+
+    if (album.isNIW) {
+        const badgeEl = document.createElement("span");
+        badgeEl.id = "badge";
+        badgeEl.textContent = "NIW";
+        nameEl.appendChild(badgeEl);
+    }
+
+    const pct = Math.min(100, Math.round((album.playedTracks / album.totalTracks) * 100));
+    const barWrap = document.createElement("div");
+    barWrap.id = "bar-wrap";
+
+    const barFill = document.createElement("div");
+    barFill.id = "bar-fill";
+    barFill.style.width = `${pct}%`;
+
+    barWrap.appendChild(barFill);
+
+    const trackLabel = document.createElement("p");
+    trackLabel.textContent = `${album.playedTracks} / ${album.totalTracks} faixas`;
+    trackLabel.id = "bar-label"
+
+    const addedAt = document.createElement("span");
+    addedAt.id = "date-label";
+    const albumDate = formatDate(album.addedAt);
+    addedAt.textContent = `${albumDate}`
+
+    const artistsEl = document.createElement("p");
+    const artists = album.artist.items.map(a => a.profile.name)
+    artistsEl.id = "album-artists"
+    artistsEl.innerHTML = `<span id="artist">${artists.join(', ')}</span>`;
+
+    if (album.userSaved) {
+        const heartEl = document.createElement("span");
+        heartEl.id = "heart";
+        heartEl.textContent = "♥";
+        artistsEl.appendChild(heartEl);
+    }
+
+    wrapper.appendChild(nameEl);
+    wrapper.appendChild(artistsEl);
+    wrapper.appendChild(trackLabel);
+    wrapper.appendChild(addedAt);
+    wrapper.appendChild(barWrap);
+
+    const info = document.createElement("div");
+    info.id = "album-info";
+    info.appendChild(wrapper);
+
+    const img = document.createElement("img");
+    img.src = album.coverUrl;
+    img.alt = album.name;
+
+    card.appendChild(img);
+    card.appendChild(info);
+    return card;
+}
+
+function hideAlbumsView() {
+    const element = getHostElement().querySelector("#album-queue-list");
+    element.style.display = "none"
+}
+
+function unhideAlbumsView() {
+    const element = getHostElement().querySelector("#album-queue-list");
+    element.style.display = "flex"
+}
+
+function destroyAlbumsView() {
+    const element = getHostElement()?.querySelector("#album-queue-list");
+    if (!element) return;
+
+    if (element._cleanup) {
+        element._cleanup();
+    }
+    element.remove();
 }
 
 function activateTab(tabList, targetBtn) {
@@ -674,208 +562,236 @@ function activateTab(tabList, targetBtn) {
 
   targetBtn.setAttribute('aria-selected', 'true');
   targetBtn.setAttribute('tabindex', '0');
+
+  return targetBtn;
 }
 
-function injectAlbumsView() {
-    console.log(LOG_PREFIX, "Generating Albums View");
 
-    const hostElement = getQueueScrollHost();
-    if (!hostElement || document.getElementById('album-queue-overlay')) return;
-
-    // Garantee host is the positioning context
-    hostElement.style.position = "relative";
-
-    const overlay = document.createElement("div");
-    overlay.id = "album-queue-overlay";
-    overlay.style.cssText = `
-        position: absolute;
-        inset: 0;
-        z-index: 10;
-        background: var(--spice-sidebar);
-        overflow-y: auto;
-        display: none;
-    `;
-
-    overlay.innerHTML = `<div id="album-queue-list" style="padding: 16px; width: 100%;"></div>`;
-
-    hostElement.appendChild(overlay);
-    return overlay;
+// ------ MISC
+function debounce<T extends (...args: unknown[]) => void>(fn: T, ms: number): T {
+  let timer: ReturnType<typeof setTimeout>;
+  return ((...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), ms);
+  }) as T;
 }
 
-function destroyAlbumsView() {
-    const { overlay } = albumsState;
-
-    if (!overlay) return;
-
-    if (overlay._cleanup) {
-        overlay._cleanup();
-    }
-
-    overlay.remove();
-    albumsState.overlay = null;
-
-    console.warn(LOG_PREFIX, "Albums View Destroyed");
-}
-
-function toggleAlbumsView(albumsOverlay, isVisible) {
-    albumsOverlay.style.display = isVisible ? "flex" : "none";
-    albumsState.isMounted = isVisible;
-}
-
-function getQueueScrollHost() {
+function getHostElement() {
     const queuePanel = document.querySelector(
         'aside[aria-label="Fila"], [aria-label="Queue"]'
     );
-    return queuePanel.querySelector("[data-overlayscrollbars-initialize]");
-
-    console.error(LOG_PREFIX, "Queue panel is not open!");
-    return null;
+    return queuePanel?.querySelector("[data-overlayscrollbars-initialize]");
 }
 
-function setupSongChangeListener() {
-    Spicetify.Player.addEventListener("songchange", () => {
-        syncSortedAlbumsStatus();
-    })
+function formatDate(ms) {
+  return new Date(ms).toLocaleString("pt-BR", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).replace(",", " 🞄 ");
 }
 
-function setupQueueUpdateListener() {
-    Spicetify.Platform.PlayerAPI.getEvents().addListener("queue_update", () => {
-        if (albumsState.overlay && albumsState.isMounted) {
-            renderAlbumsPanel(albumsState.overlay)
-        }
-    })
-}
-
-async function syncSortedAlbumsStatus() {
-    const currentTrack = Spicetify.Player.data.item;
-    if (!currentTrack) {
-        console.error(LOG_PREFIX, "Could not sync sorted albums");
-        return;
-    }
-    const currentAlbumUri = currentTrack?.album?.uri;
-    const currentTrackUri = currentTrack.uri;
-    let sortedAlbums = getSortedAlbums();
-    const queueUris = await getQueueTrackUris();
-
-    const alreadyTracked = sortedAlbums.some(a => a.uri === currentAlbumUri);
-
-    if (!alreadyTracked && currentAlbumUri) {
-        const state = await Spicetify.Platform.PlayerAPI.getState();
-        const nextTrack = state?.nextItems?.[0];
-        const nextAlbumUri = nextTrack?.track?.metadata?.album_uri ?? nextTrack?.album?.uri
-
-
-        if (nextAlbumUri === currentAlbumUri) {
-            const tracksUris = await fetchAlbumTracks(currentAlbumUri);
-            console.log(LOG_PREFIX, "Organic album detected, saving...");
-            const newEntry = {
-                index: null,
-                uri: currentAlbumUri,
-                name: currentTrack.album?.name ?? "Unknown Album",
-                artist: currentTrack.artists[0]?.name ?? "Unknown Artist",
-                coverUrl: currentTrack.album?.images?.[1]?.url ?? "",
-                numTracks: tracksUris.length,
-                tracksUris,
-                addedAt: Date.now(),
-                status: "queued",
-                playedTracks: 1
-            }
-
-            console.log(LOG_PREFIX, "Sorted Albumns2:", sortedAlbums);
-            sortedAlbums = [...sortedAlbums, newEntry];
-            setData("sorted_albums", sortedAlbums);
-        }
+function injectStyle() {
+    const style = document.createElement('style');
+    style.textContent = `
+    
+    :root {
+        --font-header: 0.875rem;
+        --font-medium: 0.825rem;
+        --font-small: 0.800rem;
+        --font-realsmall: 0.790rem;
+        --font-mydih: 0.770rem;
     }
 
-    const updatedSortedAlbums = sortedAlbums.map(album => {
-        const trackIndex = album.tracksUris.findIndex(track => track.uri === currentTrackUri);
-        const playedTracks = trackIndex >= 0 ? trackIndex + 1 : album.playedTracks;
-        const stillInQueue = album.tracksUris?.some(uri => queueUris.has(uri));
-        return { ...album, playedTracks, status: stillInQueue ? "queued" : "played"};
-    });
-
-    setData("sorted_albums", updatedSortedAlbums);
-    pruneHistory(updatedSortedAlbums, false);
-
-    // Refresh
-    if (albumsState.overlay && albumsState.isMounted) {
-        renderAlbumsPanel(albumsState.overlay)
-    }
-}
-
-function pruneHistory(sortedAlbums, force) {
-    const playedAlbums = sortedAlbums.filter(isAlbumPlayed);
-
-    if (!force && (playedAlbums.length <= MAX_HISTORY || playedAlbums.length <= albums.length)) return;
-
-    const toRemove = force ? sortedAlbums.length : playedAlbums.length - MAX_HISTORY;
-    let removed = 0;
-    const pruned = sortedAlbums.filter(a => {
-        if (force) {
-            removed++;
-            return false;
-        }
-
-        if (a.status === "played" && removed < toRemove) {
-            removed++;
-            return false;
-        }
-
-        return true;
-    });
-
-    console.warn(LOG_PREFIX, `Pruned ${toRemove} old history entries.`);
-    setData("sorted_albums", pruned);
-}
-
-function isAlbumPlayed(album) {
-    if (album.status !== "played") return false;
-    if (album.numTracks === null) return album.playedTracks >= 2;
-    return (album.playedTracks / album.numTracks) >= 0.5;
-}
-
-// ------- Storage Helpers
-
-function getSortedAlbums() {
-    return getData("sorted_albums") ?? [];
-}
-
-function getStorage() {
-    return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
-}
-
-function getUsedIndexes() {
-    const albums = getSortedAlbums();
-
-    if (!Array.isArray(albums)) return []
-
-    return albums.map(a => (typeof a === "object" ? a.index : a));
-}
-
-function getData(key) {
-    const data = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
-    return data[key];
-}
-
-function setData(key, value) {
-    let data = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
-    if (!data || typeof data !== "object" || Array.isArray(data))  data = {};
-    data[key] = value;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-    return data[key];
-}
-
-function clearUsedIndexes() {
-    const data = JSON.parse(localStorage.getItem(STORAGE_KEY));
-    data["sorted_albums"] = [];
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-
-
-    if (albumsState.overlay && albumsState.isMounted) {
-        renderAlbumsPanel(albumsState.overlay);
+    #album-queue-list {
+        position: absolute;
+        width: 100%;
+        height: 100%;
+        padding: 16px;
+        background: var(--spice-sidebar);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
     }
 
-    return data;
+    #album-queue-list #sections-wrapper {
+        display: flex;
+        gap: 20px;
+        width: 100%;
+        min-height: 100%;
+        flex-direction: column;
+        overflow-y: auto;
+        scrollbar-color: rgba(255,255,255,0.0) transparent;
+        scrollbar-width: thin;
+        transition: scrollbar-color 0.2s ease;
+        margin-left: 10px;
+        mask-image: linear-gradient(to bottom, black 97%, transparent);
+    }
+
+    #album-queue-list #sections-wrapper:hover {
+        scrollbar-color: rgba(255,255,255,0.2) transparent;
+    }
+
+    #album-queue-list h3 {
+        font-size: var(--font-header);
+        color: var(--spice-subtext);
+        font-weight: 700;
+        letter-spacing: 1px;
+        text-transform: uppercase;
+        padding: 8px;
+        border-radius: 10px;
+    }
+
+    #album-queue-list #queue-section, #album-queue-list #history-section {
+        flex: 0 0 auto;
+        background-color: var(--spice-player);
+        padding: 16px;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 15px;
+        border-radius: 10px;
+        max-height: 100%;
+        scrollbar-width: thin;
+        scrollbar-color: rgba(255,255,255,0.0) transparent;
+        transition: scrollbar-color 0.2s ease;
+        margin-right: 10px;
+    }
+
+    #album-queue-list #queue-section:hover, #album-queue-list #history-section:hover {
+        scrollbar-color: rgba(255,255,255,0.1) transparent;
+    }
+
+
+    #album-queue-list #album-card {
+        background: var(--spice-player);
+        width: 100%;
+        height: 60px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 8px;
+        border-radius: 6px;
+        margin-bottom: 4px;
+        transition: background 0.15s;
+    }
+    #album-queue-list #album-card:hover {
+        transform: scale(1.04);
+        background: var(--background-elevated-highlight);
+    }
+
+
+    #album-queue-list #album-card a {
+        color: var(--spice-text);
+        font-size: var(--font-medium);
+        font-weight: 600;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        cursor: pointer;
+        overflow: hidden;
+    }
+
+    #album-queue-list #album-card #album-artists {
+        color: var(--spice-subtext);
+        font-size: var(--font-small);
+        margin: 0;
+        white-space: nowrap;
+        overflow: hidden;
+        max-width: 60%;
+        min-width: 0;
+        position: relative;
+    }
+
+    #album-queue-list #album-name #badge {
+        font-size: var(--font-mydih);
+        margin-left: 10px;
+        margin-bottom: 2px;
+        font-weight: 600;
+        padding: 1px 8px;
+        border-radius: 99px;
+        background: var(--spice-button);
+        color: var(--spice-text);
+        letter-spacing: 1px;
+        text-decoration: none;
+    }
+
+
+    #album-queue-list #album-artists #heart {
+        font-size: 25px;
+        color: red;
+        position: absolute;
+        bottom: 0px;
+        top: -9px;
+    }
+
+    #album-queue-list #album-artists #artist {
+        display: inline-block;
+        white-space: nowrap;
+        padding-right: 0.67rem;
+    }
+
+    #album-queue-list #album-artists:hover span {
+        animation: scroll-text 8s ease-in-out both infinite;
+    }
+
+    @keyframes scroll-text {
+        0% {transform: translateX(0);}
+        50% {transform: translateX(-30%);}
+        100% {transform: translateX(0);}
+    }
+
+    #album-queue-list #album-card #album-info { flex: 1 1 auto; min-width: 0; }
+
+    #album-queue-list #album-card #card-info-wrapper {
+        display: flex;
+        flex-direction: column;
+        gap: 0.2rem;
+        position: relative;
+    }
+
+    #album-queue-list #album-card #date-label {
+        font-size: var(--font-mydih);
+        position: absolute;
+        right: 0;
+    }
+
+    #album-queue-list #album-card #bar-wrap {
+        width: 100%;
+        height: 3px;
+        background: var(--spice-card);
+        border-radius: 2px;
+        overflow: hidden;
+        margin-top: 0.25rem;
+    }
+
+    #album-queue-list #album-card #bar-fill {
+        width: 0%;
+        height: 100%;
+        background: var(--spice-button);
+        border-radius: 2px;
+        transition: width 3s;
+    }
+
+    #album-queue-list #album-card #bar-label {
+        color: var(--spice-subtext);
+        font-size: var(--font-realsmall);
+        position: absolute;
+        right: 0;
+        bottom: 10px;
+    }
+
+
+    #album-queue-list #album-card img {
+        width: 56px;
+        height: 56px;
+        border-radius: 4px;
+        object-fit: cover;
+        flex-shrink: 0;
+    }
+    `;
+    document.body.appendChild(style);
 }
 
 export default main;
